@@ -91,15 +91,26 @@ export default async function (files, renderer) {
     gltf['JITR_FILES'][path] = files[i];
   }
 
-  let cameras = [];
-  let scenes = {};
-  let nodes = {};
-  let buffers = {};
-  let accesses = {};
-  let materials = {};
-  let textures = {'images': {}};
+  const cameras = [];
+  const scenes = {};
+  const nodes = {};
+  const buffers = {};
+  const accesses = {};
+  const materials = {};
+  const textures = {'images': {}};
+  const lights = {};
+  const bones = {};
+  const skinnedMeshes = {};
 
   const envMap = createEnviroment(renderer);
+
+  if (gltf.skins instanceof Array) {
+    for (let i = 0; i < gltf.skins.length; i++) {
+      for (let j = 0; j < gltf.skins[i].joints.length; j++) {
+        bones[gltf.skins[i].joints[j]] = true;
+      }
+    }
+  }
 
   // import scenes
   for (let i = 0; i < gltf.scenes.length; i++) {
@@ -119,15 +130,41 @@ export default async function (files, renderer) {
     let sceneNodes = scene.nodes;
     for (let j = 0; j < sceneNodes.length; j++) {
       let nodeIndex = sceneNodes[j];
-      if (!nodes[nodeIndex]) await importNode(nodeIndex, gltf, nodes, cameras, materials, textures, accesses, buffers, new Nodes.TextureCubeNode(new Nodes.TextureNode(envMap)));
+      if (!nodes[nodeIndex]) await importNode(nodeIndex, gltf, nodes, cameras, lights, materials, bones, textures, accesses, buffers, new Nodes.TextureCubeNode(new Nodes.TextureNode(envMap)));
       sceneObj.add(nodes[sceneNodes[j]]);
     }
   }
+
+  await importSkins(gltf, bones, skinnedMeshes, accesses, buffers);
 }
 
-async function importNode(nodeIndex, gltf, nodes, cameras, materials, textures, accesses, buffers, envMap) {
+async function importSkins(gltf, boneNodes, skinnedMeshes, accesses, buffers) {
+  for (const [skinIndex, mesh] of Object.entries(skinnedMeshes)) {
+    const skin = gltf.skins[skinIndex];
+    const bones = skin.joints.map(jointIndex => boneNodes[jointIndex]);
+    const mats = [];
+    
+    if (skin.inverseBindMatrices !== undefined) {
+      if (accesses[skin.inverseBindMatrices] === undefined) await accessBuffer(skin.inverseBindMatrices, gltf, accesses, buffers, false);
+      let matBuffer = accesses[skin.inverseBindMatrices];
+      for (let i = 0; i < matBuffer.length; i += 16) mats.push((new THREE.Matrix4()).fromArray(matBuffer, i));
+    }
+
+    const skeleton = new THREE.Skeleton(bones, mats.length > 0 ? mats : undefined);
+    mesh.bind(skeleton);
+  }
+}
+
+async function importNode(nodeIndex, gltf, nodes, cameras, lights, materials, bones, skinnedMeshes, textures, accesses, buffers, envMap) {
   const node = gltf.nodes[nodeIndex];
-  let nodeObj = new THREE.Object3D();
+  let nodeObj = undefined;
+
+  // make node a bone if necessary
+  if (bones[nodeIndex] === true) {
+    nodeObj = new THREE.Bone();
+    bones[nodeIndex] = nodeObj;
+  }
+  else nodeObj = new THREE.Object3D();
 
   // make the node a camera if appropriate
   if (node.camera !== undefined) {
@@ -172,9 +209,18 @@ async function importNode(nodeIndex, gltf, nodes, cameras, materials, textures, 
     nodeObj.scale.set(scale[0], scale[1], scale[2]);
   }
 
-  if (node.mesh !== undefined) nodeObj.add(await createMesh(node.mesh, node.skin !== undefined, gltf, materials, textures, accesses, buffers, envMap));
+  if (node.mesh !== undefined) {
+    const mesh = await createMesh(node.mesh, node.skin !== undefined, gltf, materials, bones, textures, accesses, buffers, envMap);
+    nodeObj.add(mesh);
+    if (node.skin !== undefined) skinnedMeshes[node.skin] = mesh;
+  }
 
-  // TODO: skin, extensions, extras
+  // lighting
+  const light = ((node.extensions || {}).KHR_lights_punctual || {}).light;
+  if (light !== undefined) {
+    if (lights[light] === undefined) importLight(light, gltf);
+    nodeObj.add(lights[light].clone());
+  }
 
   nodes.add(nodeObj);
 
@@ -182,7 +228,7 @@ async function importNode(nodeIndex, gltf, nodes, cameras, materials, textures, 
   if (node.children instanceof Array) {
     for (let i = 0; i < node.children.length; i++) {
       let childIndex = node.children[i];
-      if (!nodes[childIndex]) await importNode(gltf.nodes[childIndex], gltf, nodes, cameras, materials, textures, accesses, buffers, envMap);
+      if (!nodes[childIndex]) await importNode(gltf.nodes[childIndex], gltf, nodes, cameras, lights, materials, bones, skinnedMeshes, textures, accesses, buffers, envMap);
 
       nodeObj.add(nodes[childIndex]);
     }
@@ -320,7 +366,10 @@ async function importMaterial(materialIndex, gltf, materials, textures, envMap) 
   }
 
   // ambient occlusion
-  if (material.occlusionTexture !== undefined) mat.ao = new nodes.SwitchNode(texNode(material.occlusionTexture), 'x');
+  if (material.occlusionTexture !== undefined) {
+    mat.ao = new Nodes.FloatNode(material.occlusionTexture.stength === undefined ? 1.0 : material.occlusionTexture.stength);
+    mat.ao = new Nodes.OperatorNode(mat.ao, new nodes.SwitchNode(texNode(material.occlusionTexture), 'x'), MUL);
+  }
 
   // emission
   mat.emissive = new Nodes.ColorNode(0xffffff);
@@ -418,7 +467,39 @@ async function importMaterial(materialIndex, gltf, materials, textures, envMap) 
   materials[materialIndex] = mat;
 }
 
-async function accessBuffer(accessorIndex, gltf, accesses, buffers) {
+function importLight(lightIndex, gltf, lights) {
+  const lightTemplates = ((gltf.extensions || {}).KHR_lights_punctual || {}).lights;
+  const light = lightTemplates[lightIndex];
+
+  if (light === undefined) {
+    lights[lightIndex] = new THREE.PointLight(0x000000, 0, 0.0001, 100);
+    return;
+  }
+
+  const color = light.color !== undefined ? new THREE.Color(light.color[0], light.color[1], light.color[2]) : new THREE.Color(0xffffff);
+  const intensity = light.intensity !== undefined ? light.intensity : 1.0;
+  const range = light.range !== undefined ? light.range : 0;
+
+  switch (light.type) {
+    case 'directional':
+      lights[lightIndex] = new THREE.DirectionalLight(color, intensity);
+      return;
+    case 'point':
+      lights[lightIndex] = new THREE.PointLight(color, intensity, range, 2);
+      return;
+    case 'spot':
+      let inner = (light.spot || {}).innerConeAngle;
+      inner = inner !== undefined ? inner : 0;
+      
+      let outer = (light.spot || {}).outerConeAngle;
+      outer = outer !== undefined ? outer : 0.78539816339;
+
+      lights[lightIndex] = new THREE.SpotLight(color, intensity, range, outer, 1.0 - (inner / outer), 2);
+      return;
+  }
+}
+
+async function accessBuffer(accessorIndex, gltf, accesses, buffers, attribute = true) {
   // get information about accessor
   const accessor = gltf.accessors[accessorIndex];
   let view = gltf.bufferViews[accessor.bufferView];
@@ -465,7 +546,7 @@ async function accessBuffer(accessorIndex, gltf, accesses, buffers) {
     }
   }
 
-  accesses[accessorIndex] = new THREE.BufferAttribute(typed_buffer, formatCount);
+  accesses[accessorIndex] = attribute ? new THREE.BufferAttribute(typed_buffer, formatCount) : typed_buffer;
 }
 
 async function importBuffer(bufferIndex, gltf, buffers) {

@@ -1,5 +1,7 @@
 import * as THREE from 'three';
+import * as Nodes from 'three/examples/jsm/nodes/Nodes';
 import { decode } from 'base64-arraybuffer';
+import { TextureNode } from 'three/examples/jsm/nodes/Nodes';
 
 const componentTypes = {
   5120: { 'type': 'BYTE', 'size': 1, 'array': Int8Array },
@@ -20,21 +22,53 @@ const typeFormats = {
   'MAT4': 16,
 }
 
+const attributeIDs = {
+  POSITION: 'position',
+  NORMAL: 'normal',
+  TANGENT: 'tangent',
+  TEXCOORD_0: 'uv',
+  TEXCOORD_1: 'uv2',
+  TEXCOORD_2: 'uv3',
+  TEXCOORD_3: 'uv4',
+  TEXCOORD_4: 'uv5',
+  TEXCOORD_5: 'uv6',
+  TEXCOORD_6: 'uv7',
+  TEXCOORD_7: 'uv8',
+  COLOR_0: 'color',
+  WEIGHTS_0: 'skinWeight',
+  JOINTS_0: 'skinIndex',
+};
+
+const textureFilters = {
+  9728: THREE.NearestFilter,
+  9729: THREE.LinearFilter,
+  9984: THREE.NearestMipmapNearestFilter,
+  9985: THREE.LinearMipmapNearestFilter,
+  9986: THREE.NearestMipmapLinearFilter,
+  9987: THREE.LinearMipmapLinearFilter
+};
+
+const textureWrappings = {
+  33071: THREE.ClampToEdgeWrapping,
+  33648: THREE.MirroredRepeatWrapping,
+  10497: THREE.RepeatWrapping
+};
+
 const primitiveMap = [
-  (g, m) => new THREE.Points(g, m),
-  (g, m) => new THREE.LineSegments(g, m),
-  (g, m) => new THREE.LineLoop(g, m),
-  (g, m) => new THREE.Line(g, m),
-  (g, m) => new THREE.Mesh(g, m),
-  (g, m) => new THREE.Mesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleStripDrawMode), m),
-  (g, m) => new THREE.Mesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleFanDrawMode), m),
+  (g, m, s) => new THREE.Points(g, m),
+  (g, m, s) => new THREE.LineSegments(g, m),
+  (g, m, s) => new THREE.LineLoop(g, m),
+  (g, m, s) => new THREE.Line(g, m),
+  (g, m, s) => s ? new THREE.SkinnedMesh(g, m) : new THREE.Mesh(g, m),
+  (g, m, s) => s ? new THREE.SkinnedMesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleStripDrawMode), m) : new THREE.Mesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleStripDrawMode), m),
+  (g, m, s) => s ? new THREE.SkinnedMesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleFanDrawMode), m) : new THREE.Mesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleFanDrawMode), m),
 ]
 
 const data_uri_regex = /data:(?<mime>[\w/\-\.]+);(?<encoding>\w+),(?<data>.*)/;
 
 const INVALID_DIR = new Error('Gltf Deserializer must be passed a valid directory that contains a gltf file');
 
-export default async function (files) {
+export default async function (files, renderer) {
   // try to parse the first gltf file found in directory
   if (!files instanceof Array) throw INVALID_DIR;
   
@@ -62,30 +96,36 @@ export default async function (files) {
   let nodes = {};
   let buffers = {};
   let accesses = {};
+  let materials = {};
+  let textures = {'images': {}};
+
+  const envMap = createEnviroment(renderer);
 
   // import scenes
   for (let i = 0; i < gltf.scenes.length; i++) {
     let scene = gltf.scenes[i];
-    let container = new THREE.Scene();
+    let sceneObj = new THREE.Scene();
     scenes[i] = {
       'name': scene.name || `Scene ${i}`,
-      'container': container,
+      'container': sceneObj,
       'extensions': scene.extensions,
       'extras': scene.extras,
     }
+
+    sceneObj.background = envMap;
     
     // import nodes if not already imported
     if (!scene.nodes || !scene.nodes.length) continue;
     let sceneNodes = scene.nodes;
     for (let j = 0; j < sceneNodes.length; j++) {
       let nodeIndex = sceneNodes[j];
-      if (!nodes[nodeIndex]) await importNode(nodeIndex, gltf, nodes, cameras, accesses, buffers);
-      container.add(nodes[sceneNodes[j]]);
+      if (!nodes[nodeIndex]) await importNode(nodeIndex, gltf, nodes, cameras, materials, textures, accesses, buffers, new Nodes.TextureCubeNode(new Nodes.TextureNode(envMap)));
+      sceneObj.add(nodes[sceneNodes[j]]);
     }
   }
 }
 
-async function importNode(nodeIndex, gltf, nodes, cameras, accesses, buffers) {
+async function importNode(nodeIndex, gltf, nodes, cameras, materials, textures, accesses, buffers, envMap) {
   const node = gltf.nodes[nodeIndex];
   let nodeObj = new THREE.Object3D();
 
@@ -132,7 +172,7 @@ async function importNode(nodeIndex, gltf, nodes, cameras, accesses, buffers) {
     nodeObj.scale.set(scale[0], scale[1], scale[2]);
   }
 
-  if (node.mesh !== undefined) nodeObj.add(await createMesh(node.mesh, gltf, accesses, buffers));
+  if (node.mesh !== undefined) nodeObj.add(await createMesh(node.mesh, node.skin !== undefined, gltf, materials, textures, accesses, buffers, envMap));
 
   // TODO: skin, extensions, extras
 
@@ -142,35 +182,240 @@ async function importNode(nodeIndex, gltf, nodes, cameras, accesses, buffers) {
   if (node.children instanceof Array) {
     for (let i = 0; i < node.children.length; i++) {
       let childIndex = node.children[i];
-      if (!nodes[childIndex]) await importNode(gltf.nodes[childIndex], gltf, nodes, cameras, accesses, buffers);
+      if (!nodes[childIndex]) await importNode(gltf.nodes[childIndex], gltf, nodes, cameras, materials, textures, accesses, buffers, envMap);
 
       nodeObj.add(nodes[childIndex]);
     }
   }
 }
 
-
-async function createMesh(meshIndex, gltf, accesses, buffers) {
+async function createMesh(meshIndex, skinned, gltf, materials, textures, accesses, buffers, envMap) {
   const mesh = gltf.meshes[meshIndex];
   let meshGroup = new THREE.Group();
-  meshGroup.name = `~MESH~${mesh.name || `MESH_${meshIndex}`}`;
+  
+  const defaultName = `MESH_${meshIndex}`;
+  meshGroup.name = `~MESH~${mesh.name || defaultName}`;
 
   for (let i = 0; i < mesh.primitives.length; i++) {
     let primitive = mesh.primitives[i];
     let geom = new THREE.BufferGeometry();
 
-    if (accesses[primitive.index] === undefined) await accessBuffer(primitive.index, gltf, accesses, buffers);
-    geom.setIndex(accesses[primitive.index]);
+    // add indices
+    if (primitive.index !== undefined) {
+      if (accesses[primitive.index] === undefined) await accessBuffer(primitive.index, gltf, accesses, buffers);
+      geom.setIndex(accesses[primitive.index]);
+    }
     
-    
+    // add attributes
     for (const [attribute, accessor] of Object.entries(primitive.attributes)) {
       if (accesses[accessor] === undefined) await accessBuffer(accessor, gltf, accesses, buffers);
-      geom.setAttribute(attribute, accesses[accessor]);
+      geom.setAttribute(attributeIDs[attribute], accesses[accessor]);
     }
 
-    // TODO: ADD MATERIALS
-    meshGroup.add(primitiveMap[primitive.mode](goem, ))
+    let addedTargets = false;
+    // add morph targets
+    if (primitive.targets instanceof Array) {
+      const morphTargets = {};
+
+      for (let j = 0; j < primitive.targets.length; j++) {
+        for (const [attribute, accessor] of Object.entries(primitive.targets[i])) {
+          if (accesses[accessor] === undefined) await accessBuffer(accessor, gltf, accesses, buffers);
+          morphTargets[attribute] = [];
+        }
+      }
+
+      for (let j = 0; j < primitive.targets.length; j++) {
+        for (const [attribute, map] of Object.entries(morphTargets)) {
+          let id = attributeIDs[attribute];
+          let accessor = primitive.targets[i][attribute];
+          map.push(accessor === undefined ? geom.attributes[id] : accesses[accessor]);
+        }
+      }
+
+      for (const [attribute, map] of Object.entries(morphTargets)) {
+        geom.morphAttributes[attributeIDs[attribute]] = map;
+      }
+
+      addedTargets = true;
+      geom.morphTargetsRelative = true;
+    }
+
+    if (materials[primitive.material] === undefined) await importMaterial(primitive.material, gltf, materials, textures, envMap);
+    let material = materials[primitive.material];
+
+    const vTan = geom.attributes.tangent !== undefined;
+    const vCol = geom.attributes.color !== undefined;
+    const noNorm = geom.attributes.normal === undefined;
+    const mTargets = Object.keys(geom.morphAttributes).length > 0;
+    const mNormals = mTargets && geom.morphAttributes.normal !== undefined;
+
+    if (skinned || vTan || vCol || noNorm || mTargets) {
+      const key = `${primitive.material}-${(skinned ? 16 : 0) | (vTan ? 8 : 0) | (vCol ? 4 : 0) | (noNorm ? 2 : 0) | (mTargets ? 1 : 0)}`
+      if (materials[key] === undefined) {
+        materials[key] = material.clone();
+        if (skinned) material.skinning = true;
+        if (vTan) material.vertexTangents = true;
+        if (vCol) material.vertexColors = true;
+        if (noNorm) material.flatShading = true;
+        if (mTargets) material.morphTargets = true;
+        if (mNormals) material.morphNormals = true;
+      }
+      
+      material = materials[key];
+    }
+
+    if (!vTan && (material.normal !== undefined || material.clearcoatNormal !== undefined)) {
+      material = material.clone();
+      if (material.normal !== undefined)
+        material.normal.scale = new Nodes.OperatorNode(new Nodes.Vector2Node(1, -1), material.normal.scale, Nodes.OperatorNode.MUL);
+  
+      if (material.clearcoatNormal !== undefined)
+        material.clearcoatNormal.scale = new Nodes.OperatorNode(new Nodes.Vector2Node(1, -1), material.clearcoatNormal.scale, Nodes.OperatorNode.MUL);
+    }
+
+    let primitiveObj = primitiveMap[primitive.mode](goem, material, skinned);
+
+    if (addedTargets) {
+      primitiveObj.updateMorphTargets();
+      if (mesh.weights instanceof Array) {
+        for (let i = 0; i < mesh.weights.length; i++) {
+          primitiveObj.morphTargetInfluences[i] = mesh.weights[i];
+        }
+      }
+    }
+
+    meshGroup.add(addedTargets);
   }
+}
+
+async function importMaterial(materialIndex, gltf, materials, textures, envMap) {
+  let material = gltf.materials[materialIndex];
+  let mat = new Nodes.StandardNodeMaterial();
+
+  const { MUL, ADD } = Nodes.OperatorNode;
+
+  // handle meshes with no materials
+  if (material === undefined) {
+    if (materials[undefined] === undefined) materials[undefined] = materialObj;
+    return;
+  }
+
+  const uvNodes = {};
+  const uvNode = (index) =>  {
+    if (uvs[index] === undefined) uvs[index] = new Nodes.UVNode(index);
+    return uvs[index];
+  };
+  const texNode = (tex, sRGB = false) => {
+    if (textures[tex.index] === undefined) importTexture(tex.index);
+    if (sRGB) textures[tex.index].encoding = THREE.sRGBEncoding;
+    return new TextureNode(textures[tex.index], uvNode(tex.texCoord));
+  }
+
+  // normal mapping
+  if (material.normalTexture !== undefined) {
+    mat.normal = new Nodes.NormalMapNode(
+      texNode(material.normalTexture),
+      material.normalTexture.scale === undefined ? 1.0 : material.normalTexture.scale
+    );
+  }
+
+  // ambient occlusion
+  if (material.occlusionTexture !== undefined) mat.ao = new nodes.SwitchNode(texNode(material.occlusionTexture), 'x');
+
+  // emission
+  mat.emissive = new Nodes.ColorNode(0xffffff);
+  if (material.emissiveFactor)
+    mat.emissive = new Nodes.ColorNode(material.emissiveFactor[0], material.emissiveFactor[1], material.emissiveFactor[2]);
+  if (material.emissiveTexture)
+    mat.emissive = new Nodes.OperatorNode(mat.emissive, new nodes.SwitchNode(texNode(material.emissiveTexture, true), 'xyz'), MUL);
+
+  // alpha rendering
+  if (material.alphaMode !== 'BLEND') {
+    mat.depthWrite = true;
+    mat.mask = new Nodes.CondNode(
+      mat.alpha,
+      material.alphaMode !== 'MASK' ? new Nodes.FloatNode(0) : new Nodes.FloatNode(material.alphaCutoff === undefined ? 0.5 : material.alphaCutoff),
+      Nodes.CondNode.GREATER
+    );
+    mat.alpha = undefined;
+  }
+  else mat.depthWrite = false;
+
+  // side rendering
+  mat.side = material.doubleSided ? THREE.DoubleSide : THREE.FrontSide;
+
+  // pbr properties
+  const pbr = material.pbrMetallicRoughness;
+  if (pbr !== undefined) {
+    // color and opacity
+    mat.color = new Nodes.ColorNode(0xffffff);
+    mat.alpha = new Nodes.FloatNode(1.0);
+
+    if (pbr.baseColorFactor !== undefined) {
+      mat.color = new Nodes.ColorNode(pbr.baseColorFactor[0], pbr.baseColorFactor[1], pbr.baseColorFactor[2]);
+      mat.alpha = new Nodes.FloatNode(pbr.baseColorFactor[3]);
+    }
+  
+    if (pbr.baseColorTexture !== undefined) {
+      const colorTex = texNode(pbr.baseColorTexture, true);
+      mat.color = new Nodes.OperatorNode(mat.color, new Nodes.SwitchNode(colorTex, 'xyz'), MUL);
+      if (colorTex.value.format !== THREE.RGBFormat)
+        mat.alpha = new Nodes.OperatorNode(mat.opacity, new Nodes.SwitchNode(colorTex, 'w'), MUL);
+    }
+
+    // metallicness and roughness
+    mat.metalness = new Nodes.FloatNode(pbr.metallicFactor === undefined ? 1.0 : pbr.metallicFactor);
+    mat.roughness = new Nodes.FloatNode(pbr.roughnessFactor === undefined ? 1.0 : pbr.roughnessFactor);
+    if (pbr.metallicRoughnessTexture !== undefined) {
+      const mrTex = texNode(pbr.metallicRoughnessTexture);
+      mat.metalness = new Nodes.OperatorNode(new Nodes.SwitchNode(mrTex, 'z'), mat.reflectivity, MUL);
+      mat.roughness = new Nodes.OperatorNode(new Nodes.SwitchNode(mrTex, 'y'), mat.roughness, MUL);
+    }
+  }
+
+  // clearcoat extension
+  const clearcoat = (material.extensions || {}).KHR_materials_clearcoat;
+  if (clearcoat !== undefined) {
+    mat.clearcoat = new Nodes.FloatNode(clearcoat.clearcoatFactor === undefined ? 0.0 : clearcoat.clearcoatFactor);
+    if (clearcoat.clearcoatTexture !== undefined)
+      mat.clearcoat = new Nodes.OperatorNode(new Nodes.SwitchNode(texNode(clearcoat.clearcoatTexture), 'x'), mat.clearcoat, MUL);
+
+    mat.clearcoatRoughness = new Nodes.FloatNode(clearcoat.clearcoatRoughnessFactor === undefined ? 0.0 : clearcoat.clearcoatRoughnessFactor);
+    if (clearcoat.clearcoatRoughnessTexture !== undefined)
+      mat.clearcoatRoughness = new Nodes.OperatorNode(new Nodes.SwitchNode(texNode(clearcoat.clearcoatRoughnessTexture), 'y'), mat.clearcoatRoughness, MUL);
+
+    if (clearcoat.clearcoatNormalTexture !== undefined) {
+      mat.clearcoatNormal = new Nodes.NormalMapNode(
+        texNode(clearcoat.clearcoatNormalTexture),
+        clearcoat.clearcoatNormalTexture.scale === undefined ? 1.0 : clearcoat.clearcoatNormalTexture.scale
+      );
+    }
+  }
+
+  // sheen extension
+  const sheen = (material.extensions || {}).KHR_materials_sheen;
+  if (sheen !== undefined) {
+    mat.sheen = new Nodes.ColorNode(0x000000);
+
+    if (sheen.sheenColorFactor !== undefined)
+      mat.sheen = new Nodes.ColorNode(sheen.sheenColorFactor[0], sheen.sheenColorFactor[1], sheen.sheenColorFactor[2]);
+    if (sheen.sheenColorTexture !== undefined) 
+      mat.sheen = new Nodes.OperatorNode(mat.sheen, new Nodes.SwitchNode(texNode(sheen.sheenColorTexture), 'xyz'), MUL);
+
+    if (sheen.sheenRoughnessFactor != undefined || sheen.sheenRoughnessTexture != undefined) {
+      let sheenRoughness = new Nodes.FloatNode(sheen.sheenRoughnessFactor === undefined ? 0.0 : sheen.sheenRoughnessFactor)
+      if (sheen.sheenRoughnessTexture){
+        const roughTex = texNode(sheen.sheenRoughnessTexture);
+        if (roughTex.value.format !== THREE.RGBFormat)
+          sheenRoughness = new Nodes.OperatorNode(new Nodes.SwitchNode(roughTex, 'w'), scale, MUL);
+      }
+      mat.roughness = new Nodes.OperatorNode(new Nodes.OperatorNode(mat.roughness, sheenRoughness, ADD), new Nodes.FloatNode(0.5), MUL);
+    }
+  }
+
+  mat.environment = envMap;
+
+  materials[materialIndex] = mat;
 }
 
 async function accessBuffer(accessorIndex, gltf, accesses, buffers) {
@@ -227,4 +472,82 @@ async function importBuffer(bufferIndex, gltf, buffers) {
   const buffer = gltf.buffers[bufferIndex];
   if (data_uri_regex.test(buffer.uri)) buffers[bufferIndex] = decode(data_uri_regex.exec(buffer.uri).groups.data);
   else buffers[bufferIndex] = await gltf['JITR_FILES'][buffer.uri].arrayBuffer();
+}
+
+function importTexture(textureIndex, gltf, textures) {
+  const texture = gltf.textures[textureIndex];
+  const sampler = gltf.samplers[texture.sampler];
+
+  let textureObj = new THREE.Texture();
+  textureObj.wrapS = textureFilters[sampler.wrapS] || THREE.LinearFilter;
+  textureObj.wrapT = textureFilters[sampler.wrapT] || THREE.LinearMipmapLinearFilter;
+  textureObj.magFilter = textureWrappings[sampler.magFilter] || THREE.RepeatWrapping;
+  textureObj.minFilter = textureWrappings[sampler.minFilter] || THREE.RepeatWrapping;
+  textureObj.flipY = false;
+
+  let alpha = true;
+  if (textures.images[texture.source] === undefined) {
+    const image = new Image();
+
+    let image_uri = gltf.images[texture.source];
+    
+    let imageContainer = undefined;
+    if (data_uri_regex.test(image_uri)) {
+      const imageInfo = data_uri_regex.exec(image_uri).groups;
+      alpha = !(imageInfo.mime.endsWith('jpeg') || imageInfo.mime.endsWith('jpg'));
+      imageContainer = new Blob([decode(imageInfo.data)]);
+    }
+    else {
+      alpha = gltf['JITR_FILES'][image_uri].type !== 'image/jpeg';
+      imageContainer = gltf['JITR_FILES'][image_uri];
+    }
+
+    image.src = URL.createObjectURL(imageContainer);
+    image.onload(() => {
+      texture.image = image;
+      texture.needsUpdate = true;
+    });
+    textures.images[texture.source] = image;
+  }
+  
+  if (!alpha) textureObj.format = THREE.RGBFormat;
+  textureObj.image = textures.images[texture.source];
+  textureObj.needsUpdate = true;
+  textures[textureIndex] = textureObj;
+}
+
+// https://github.com/mrdoob/three.js/blob/master/examples/webgl_materials_envmaps_hdr_nodes.html
+function createEnviroment(renderer) {
+  const envScene = new THREE.Scene();
+
+  const geometry = new THREE.BoxBufferGeometry();
+  geometry.deleteAttribute('uv');
+  const roomMaterial = new THREE.MeshStandardMaterial({ metalness: 0, side: THREE.BackSide });
+  const room = new THREE.Mesh(geometry, roomMaterial);
+  room.scale.setScalar(10);
+  envScene.add(room);
+
+  const mainLight = new THREE.PointLight(0xffffff, 50, 0, 2);
+  envScene.add(mainLight);
+
+  const lightMaterial = new THREE.MeshLambertMaterial({ color: 0x000000, emissive: 0xffffff, emissiveIntensity: 10 });
+
+  const light1 = new THREE.Mesh(geometry, lightMaterial);
+  light1.position.set(-5, 2, 0);
+  light1.scale.set(0.1, 1, 1);
+  envScene.add(light1);
+
+  const light2 = new THREE.Mesh(geometry, lightMaterial);
+  light2.position.set(0, 5, 0);
+  light2.scale.set(1, 0.1, 1);
+  envScene.add(light2);
+
+  const light3 = new THREE.Mesh(geometry, lightMaterial);
+  light3.position.set(2, 1, 5);
+  light3.scale.set(1.5, 2, 0.1);
+  envScene.add(light3);
+
+  const pmremGenerator = new THREE.PMREMGenerator(renderer);
+  pmremGenerator.compileCubemapShader();
+  return pmremGenerator.fromScene(envScene, 0.04).texture;
 }

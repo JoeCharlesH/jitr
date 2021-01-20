@@ -2,24 +2,26 @@ import * as THREE from 'three';
 import * as Nodes from 'three/examples/jsm/nodes/Nodes';
 import { decode } from 'base64-arraybuffer';
 import { TextureNode } from 'three/examples/jsm/nodes/Nodes';
+import CubicSpline from './cubic_spline_interpolant';
+import { AnimationClip } from 'three';
 
 const componentTypes = {
-  5120: { 'type': 'BYTE', 'size': 1, 'array': Int8Array },
-  5121: { 'type': 'UNSIGNED_BYTE', 'size': 1, 'array': Uint8Array },
-  5122: { 'type': 'SHORT', 'size': 2, 'array': Int16Array },
-  5123: { 'type': 'UNSIGNED_SHORT', 'size': 2, 'array': Uint16Array },
-  5125: { 'type': 'UNSIGNED_INT', 'size': 4, 'array': Uint32Array },
-  5126: { 'type': 'FLOAT', 'size': 4, 'array': Float32Array },
+  5120: { type: 'BYTE', size: 1, array: Int8Array },
+  5121: { type: 'UNSIGNED_BYTE', size: 1, array: Uint8Array },
+  5122: { type: 'SHORT', size: 2, array: Int16Array },
+  5123: { type: 'UNSIGNED_SHORT', size: 2, array: Uint16Array },
+  5125: { type: 'UNSIGNED_INT', size: 4, array: Uint32Array },
+  5126: { type: 'FLOAT', size: 4, array: Float32Array },
 }
 
 const typeFormats = {
-  'SCALAR': 1,
-  'VEC2': 2,
-  'VEC3': 3,
-  'VEC4': 4,
-  'MAT2': 4,
-  'MAT3': 9,
-  'MAT4': 16,
+  SCALAR: 1,
+  VEC2: 2,
+  VEC3: 3,
+  VEC4: 4,
+  MAT2: 4,
+  MAT3: 9,
+  MAT4: 16,
 }
 
 const attributeIDs = {
@@ -63,6 +65,26 @@ const primitiveMap = [
   (g, m, s) => s ? new THREE.SkinnedMesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleStripDrawMode), m) : new THREE.Mesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleStripDrawMode), m),
   (g, m, s) => s ? new THREE.SkinnedMesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleFanDrawMode), m) : new THREE.Mesh(THREE.BufferGeometryUtils.toTrianglesDrawMode(g, THREE.TriangleFanDrawMode), m),
 ]
+
+const interpolantMap = {
+  STEP: THREE.DiscreteInterpolant,
+  LINEAR: THREE.LinearInterpolant,
+  CUBICSPLINE: CubicSpline,
+}
+
+const pathMap = {
+  translation: { property: 'position', track: THREE.VectorKeyframeTrack },
+  rotation: { property: 'rotation', track: THREE.QuaternionKeyframeTrack },
+  scale: { property: 'scale', track: THREE.VectorKeyframeTrack },
+  weight: { property: 'morphTargetInfluences', track: THREE.NumberKeyframeTrack },
+}
+
+const typeScale = {};
+typeScale[Int8Array] = 1 / 127;
+typeScale[Uint8Array] = 1 / 255;
+typeScale[Int16Array] = 1 / 32767;
+typeScale[Uint16Array] = 1 / 65535;
+typeScale[Float32Array] = 1;
 
 const data_uri_regex = /data:(?<mime>[\w/\-\.]+);(?<encoding>\w+),(?<data>.*)/;
 
@@ -136,6 +158,9 @@ export default async function (files, renderer) {
   }
 
   await importSkins(gltf, bones, skinnedMeshes, accesses, buffers);
+  const animations = await importAnimations(gltf, nodes, accesses, buffers);
+
+  return { scenes, cameras, nodes, lights, animations };
 }
 
 async function importSkins(gltf, boneNodes, skinnedMeshes, accesses, buffers) {
@@ -149,10 +174,57 @@ async function importSkins(gltf, boneNodes, skinnedMeshes, accesses, buffers) {
       let matBuffer = accesses[skin.inverseBindMatrices];
       for (let i = 0; i < matBuffer.length; i += 16) mats.push((new THREE.Matrix4()).fromArray(matBuffer, i));
     }
-
-    const skeleton = new THREE.Skeleton(bones, mats.length > 0 ? mats : undefined);
-    mesh.bind(skeleton);
+    
+    mesh.bind(new THREE.Skeleton(bones, mats.length > 0 ? mats : undefined), mesh.matrixWorld);
   }
+}
+
+async function importAnimations(gltf, nodes, accesses, buffers) {
+  const animations = [];
+
+  for (let i = 0; i < gltf.animations.lenghth; i++) {
+    const anim = gltf.animations[i];
+    const tracks = [];
+
+    for (let j = 0; j < anim.channels.length; j++) {
+      const sampler = anim.samplers[anim.channels[j].sampler];
+      const path = pathMap[anim.channels[j].target.path];
+      const node = nodes[anim.channels[j].target.path];
+
+      const input = await accessBuffer(sampler.input, gltf, accesses, buffers, false);
+      const output = await accessBuffer(sampler.output, gltf, accesses, buffers, false);
+
+      node.updateMatrix();
+      node.matrixAutoUpdate = true;
+
+      const ids = [];
+      if (path.property === 'morphTargetInfluences') {
+        node.traverse((o) => {
+          if (o.isMesh === true && o.morphTargetInfluences) ids.push(o.uuid);
+        });
+      }
+      else ids.push(node.uuid);
+
+      const interpolant = interpolantMap[sampler.interpolation];
+
+      for (let k = 0; k < ids.length; k++) {
+        const track = new path.track(`${ids[k]}.${path.property}`, input, output, interpolant);
+  
+        if (interpolant === CubicSpline) {
+          track.createInterpolant = function InterpolantFactory(r) {
+            return new CubicSpline(this.times, this.values, this.getValueSize() / 3, r);
+          }
+          track.createInterpolant.isInterpolantCubicSpline = true;
+        }
+  
+        tracks.push(track);
+      }
+    }
+
+    animations.push(new AnimationClip(anim.name ? anim.name : `animation_${i}`, undefined, tracks));
+  }
+
+  return animations;
 }
 
 async function importNode(nodeIndex, gltf, nodes, cameras, lights, materials, bones, skinnedMeshes, textures, accesses, buffers, envMap) {
@@ -239,8 +311,7 @@ async function createMesh(meshIndex, skinned, gltf, materials, textures, accesse
   const mesh = gltf.meshes[meshIndex];
   let meshGroup = new THREE.Group();
   
-  const defaultName = `MESH_${meshIndex}`;
-  meshGroup.name = `~MESH~${mesh.name || defaultName}`;
+  meshGroup.name = `MESH_${mesh.name || meshIndex}`;
 
   for (let i = 0; i < mesh.primitives.length; i++) {
     let primitive = mesh.primitives[i];
@@ -330,7 +401,7 @@ async function createMesh(meshIndex, skinned, gltf, materials, textures, accesse
       }
     }
 
-    meshGroup.add(addedTargets);
+    meshGroup.add(primitiveObj);
   }
 }
 
@@ -546,7 +617,17 @@ async function accessBuffer(accessorIndex, gltf, accesses, buffers, attribute = 
     }
   }
 
-  accesses[accessorIndex] = attribute ? new THREE.BufferAttribute(typed_buffer, formatCount) : typed_buffer;
+  if (attribute) accesses[accessorIndex] = new THREE.BufferAttribute(typed_buffer, formatCount, accessor.normalized === true);
+  else {
+    if (accessor.normalized === true) {
+      let scale = typeScale[typed_buffer.constructor];
+      let scaled = new Float32Array(typed_buffer.length);
+      for (let i = 0; i < scaled.length; i++) scaled[i] = typed_buffer[i] * scale;
+      typed_buffer = scaled;
+    }
+
+    accesses[accessorIndex] = typed_buffer;
+  }
 }
 
 async function importBuffer(bufferIndex, gltf, buffers) {
